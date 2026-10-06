@@ -1,0 +1,16 @@
+{
+  "empty-dir": {},
+  "nested": {
+    "a": {
+      "b": {
+        "deep": "bottom\n"
+      }
+    }
+  },
+  "unicode": "héllo — ünïcode ✓\n",
+  "empty-file": "",
+  "no-trailing-newline": "x",
+  "dangling-link": ["link", "nowhere/at/all"],
+  "dot-in-name.txt": "fine\n",
+  "exec": ["script", "#!/bin/sh\nexit 0\n"]
+}

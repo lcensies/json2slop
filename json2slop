@@ -1,0 +1,160 @@
+#!/bin/sh
+# json2slop — one CLI, every json2dir implementation as a backend.
+# No `set -e`: the capability checks below are `test && action` chains, which a
+# failing first test would turn into a silent exit.
+set -u
+
+VERSION=0.1.0
+PREFIX=${J2S_PREFIX:-/opt/json2slop}
+
+# CAPS letters: n dry-run, v verbose, c no-clobber, l llm options.
+# -o is universal: cwd-only backends get it by running them inside the target.
+backend_info() {
+	case $1 in
+	zig) BIN=${J2S_BIN_ZIG:-$PREFIX/zig/json2dir}; MODE=flags; CAPS=nvc ;;
+	rust) BIN=${J2S_BIN_RUST:-$PREFIX/rust/json2dir}; MODE=stdin; CAPS= ;;
+	scheme) BIN=${J2S_BIN_SCHEME:-$PREFIX/scheme/bin/json2dir}; MODE=stdin; CAPS= ;;
+	cs) BIN=${J2S_BIN_CS:-$PREFIX/cs/json2dir-cs}; MODE=pos; CAPS= ;;
+	llm) BIN=${J2S_BIN_LLM:-$PREFIX/llm/json2llm}; MODE=flags; CAPS=nvcl ;;
+	dir2json) BIN=${J2S_BIN_DIR2JSON:-$PREFIX/dir2json/dir2json}; MODE=reverse; CAPS= ;;
+	*) return 1 ;;
+	esac
+}
+
+BACKENDS='rust zig scheme cs llm'
+
+die() { printf 'json2slop: %s\n' "$*" >&2; exit 1; }
+
+has_cap() { case $CAPS in *"$1"*) return 0 ;; esac; return 1; }
+
+refuse() { die "backend $BACKEND does not support $1"; }
+
+usage() {
+	cat <<'EOF'
+Usage: json2slop [OPTIONS] [FILE]
+       json2slop reverse [OPTIONS] [DIR]
+
+Materialize a JSON document as a directory tree, using any of the independent
+json2dir implementations as the backend. FILE defaults to stdin ("-" is stdin).
+
+Options:
+  -b, --backend <B>      rust | zig | scheme | cs | llm   (default: zig)
+  -o, --out <DIR>        Target directory (default: .). Created if missing.
+  -n, --dry-run          Print the plan; write nothing.      [zig, llm]
+  -v, --verbose          One line per entry while applying.  [zig, llm]
+      --no-clobber       Fail instead of replacing entries.   [zig, llm]
+      --llm-backend <B>  openai|pi|claude|codex|opencode|local|file:PATH  [llm]
+  -m, --model <M>        Model for the llm backend's openai mode.         [llm]
+      --list-backends    Print backends with their supported options.
+  -h, --help             Print this help and exit.
+  -V, --version          Print version and exit.
+
+reverse (dir2json): print the JSON document reproducing DIR.
+  -c, --compact          Compact output.
+  -s, --skip-special     Skip FIFOs/sockets/devices with a warning.
+      --check FILE       Compare DIR against FILE; exit 3 on drift.
+
+Options a backend cannot honour are a usage error, never silently dropped.
+Backend exit codes are propagated unchanged; 1 means json2slop usage error.
+EOF
+}
+
+list_backends() {
+	printf '%-9s %-28s %s\n' BACKEND BINARY 'SUPPORTS'
+	for b in $BACKENDS dir2json; do
+		backend_info "$b"
+		opts='-o'
+		[ "$MODE" = reverse ] && opts='reverse: -c -s --check'
+		has_cap n && opts="$opts -n"
+		has_cap v && opts="$opts -v"
+		has_cap c && opts="$opts --no-clobber"
+		has_cap l && opts="$opts --llm-backend -m"
+		[ -x "$BIN" ] && state=$BIN || state="$BIN (missing)"
+		printf '%-9s %-28s %s\n' "$b" "$state" "$opts"
+	done
+}
+
+abspath() { case $1 in /*) printf '%s\n' "$1" ;; *) printf '%s\n' "$PWD/$1" ;; esac; }
+
+# reverse: everything is dir2json's own interface, so pass it through.
+if [ "${1-}" = reverse ]; then
+	shift
+	BACKEND=dir2json
+	backend_info dir2json
+	[ -x "$BIN" ] || die "backend dir2json is not installed at $BIN"
+	exec "$BIN" "$@"
+fi
+
+BACKEND=zig
+out=
+dry= verbose= noclobber= llmb= model= doc=
+
+while [ $# -gt 0 ]; do
+	case $1 in
+	-b | --backend) BACKEND=${2?"--backend needs a value"}; shift 2 ;;
+	-b=* | --backend=*) BACKEND=${1#*=}; shift ;;
+	-o | --out) out=${2?"--out needs a value"}; shift 2 ;;
+	-o=* | --out=*) out=${1#*=}; shift ;;
+	-m | --model) model=${2?"--model needs a value"}; shift 2 ;;
+	-m=* | --model=*) model=${1#*=}; shift ;;
+	--llm-backend) llmb=${2?"--llm-backend needs a value"}; shift 2 ;;
+	--llm-backend=*) llmb=${1#*=}; shift ;;
+	-n | --dry-run) dry=1; shift ;;
+	-v | --verbose) verbose=1; shift ;;
+	--no-clobber) noclobber=1; shift ;;
+	--list-backends) list_backends; exit 0 ;;
+	-h | --help) usage; exit 0 ;;
+	-V | --version) echo "json2slop $VERSION"; exit 0 ;;
+	--) shift; [ $# -gt 0 ] && doc=$1 && shift; break ;;
+	-*) die "unknown option $1 (--help for usage)" ;;
+	*) [ -z "$doc" ] || die "only one FILE may be given"; doc=$1; shift ;;
+	esac
+done
+
+backend_info "$BACKEND" || die "unknown backend $BACKEND (valid: $BACKENDS, or 'reverse' for dir2json)"
+[ "$MODE" = reverse ] && die "backend dir2json is the reverse direction: use 'json2slop reverse'"
+[ -x "$BIN" ] || die "backend $BACKEND is not installed at $BIN"
+
+if [ -n "$dry" ]; then has_cap n || refuse --dry-run; fi
+if [ -n "$verbose" ]; then has_cap v || refuse --verbose; fi
+if [ -n "$noclobber" ]; then has_cap c || refuse --no-clobber; fi
+if [ -n "$llmb" ]; then has_cap l || refuse --llm-backend; fi
+if [ -n "$model" ]; then has_cap l || refuse --model; fi
+
+# Normalize the document: a path for backends that take one, stdin for the rest.
+if [ -n "$doc" ] && [ "$doc" != - ]; then
+	[ -r "$doc" ] || die "cannot read $doc"
+	doc=$(abspath "$doc")
+elif [ "$MODE" = stdin ]; then
+	doc= # straight through
+else
+	tmp=$(mktemp "${TMPDIR:-/tmp}/json2slop.XXXXXX")
+	trap 'rm -f "$tmp"' EXIT HUP INT TERM
+	cat >"$tmp" || exit 3
+	doc=$tmp
+fi
+
+# A dry run must not create the target, so only wet runs get the mkdir.
+if [ -n "$out" ] && [ -z "$dry" ]; then
+	mkdir -p "$out" || exit 3
+fi
+
+case $MODE in
+flags)
+	set --
+	[ -n "$out" ] && set -- "$@" -o "$out"
+	[ -n "$dry" ] && set -- "$@" -n
+	[ -n "$verbose" ] && set -- "$@" -v
+	[ -n "$noclobber" ] && set -- "$@" --no-clobber
+	[ -n "$llmb" ] && set -- "$@" -b "$llmb"
+	[ -n "$model" ] && set -- "$@" -m "$model"
+	exec "$BIN" "$@" "$doc"
+	;;
+stdin)
+	cd "${out:-.}"
+	if [ -n "$doc" ]; then exec "$BIN" <"$doc"; else exec "$BIN"; fi
+	;;
+pos)
+	exec "$BIN" "$doc" "${out:-.}"
+	;;
+esac
